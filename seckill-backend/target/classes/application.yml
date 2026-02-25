@@ -1,0 +1,96 @@
+server:
+  port: 8080
+  servlet:
+    context-path: /api
+
+spring:
+  application:
+    name: seckill-system
+
+  # ==================== 数据源配置 ====================
+  datasource:
+    driver-class-name: com.mysql.cj.jdbc.Driver
+    url: jdbc:mysql://192.168.150.103:3306/seckill?useUnicode=true&characterEncoding=utf-8&useSSL=false&serverTimezone=Asia/Shanghai&allowPublicKeyRetrieval=true&nullCatalogMeansCurrent=true
+    username: root
+    password: 123456
+    hikari:
+      minimum-idle: 5
+      maximum-pool-size: 20
+      idle-timeout: 30000
+      max-lifetime: 1800000
+      connection-timeout: 30000
+
+  # ==================== Redis配置 ====================
+  data:
+    redis:
+      host: 192.168.150.103
+      port: 6379
+      password:
+      database: 1
+      lettuce:
+        pool:
+          max-active: 20
+          max-idle: 10
+          min-idle: 5
+          max-wait: 3000ms
+
+  # ==================== RabbitMQ配置 ====================
+  rabbitmq:
+    host: 192.168.150.103
+    port: 5672
+    username: admin
+    password: 123456
+    virtual-host: /
+    listener:
+      simple:
+        acknowledge-mode: manual
+        prefetch: 1
+        retry:
+          enabled: true
+          max-attempts: 3
+          initial-interval: 3000ms
+
+  # ==================== Jackson配置 ====================
+  jackson:
+    date-format: yyyy-MM-dd HH:mm:ss
+    time-zone: Asia/Shanghai
+    serialization:
+      write-dates-as-timestamps: false
+
+# ==================== MyBatis-Plus配置 ====================
+mybatis-plus:
+  mapper-locations: classpath:mapper/**/*.xml
+  configuration:
+    map-underscore-to-camel-case: true
+    log-impl: org.apache.ibatis.logging.stdout.StdOutImpl
+  global-config:
+    db-config:
+      id-type: auto
+      logic-delete-field: deleted
+      logic-delete-value: 1
+      logic-not-delete-value: 0
+
+# ==================== JWT配置 ====================
+jwt:
+  secret: seckill-system-jwt-secret-key-2024-must-be-at-least-256-bits-long
+  expiration: 86400000  # 24小时(毫秒)
+  header: Authorization
+  prefix: "Bearer "
+
+# ==================== Knife4j配置 ====================
+springdoc:
+  swagger-ui:
+    path: /swagger-ui.html
+  api-docs:
+    path: /v3/api-docs
+
+knife4j:
+  enable: true
+  setting:
+    language: zh_cn
+
+# ==================== 日志配置 ====================
+logging:
+  level:
+    com.seckill: debug
+    org.springframework: info
