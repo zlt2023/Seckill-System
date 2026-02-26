@@ -1,9 +1,9 @@
 package com.seckill.service;
 
 import cn.hutool.crypto.digest.DigestUtil;
+import com.baomidou.mybatisplus.core.conditions.query.LambdaQueryWrapper;
 import com.seckill.common.ResultCode;
 import com.seckill.config.RabbitMQConfig;
-import com.seckill.controller.CaptchaController;
 import com.seckill.dto.SeckillMessage;
 import com.seckill.entity.Goods;
 import com.seckill.entity.OrderInfo;
@@ -22,7 +22,7 @@ import org.springframework.transaction.annotation.Transactional;
 
 import jakarta.annotation.PostConstruct;
 import java.time.LocalDateTime;
-import java.util.Collections;
+import java.util.Arrays;
 import java.util.List;
 import java.util.Map;
 import java.util.UUID;
@@ -32,6 +32,13 @@ import java.util.concurrent.TimeUnit;
 /**
  * 秒杀服务 - 核心业务逻辑
  * 安全防护：验证码 → 路径隐藏 → 限流 → 内存标记 → Redis预减 → MQ异步
+ *
+ * 重构修复清单:
+ * - P0-2: validateSeckillPath 使用原子 getAndDelete
+ * - P0-3: 重复判断+预减库存合并为单个 Lua 原子脚本
+ * - P1-1: 依赖 CaptchaService 替代 CaptchaController
+ * - P1-3: 暴露 clearStockOverFlag 方法供订单取消时调用
+ * - P1-6: initSeckillStock 仅加载进行中的秒杀商品
  */
 @Slf4j
 @Service
@@ -42,41 +49,47 @@ public class SeckillService {
     private final SeckillOrderMapper seckillOrderMapper;
     private final GoodsService goodsService;
     private final OrderService orderService;
-    private final CaptchaController captchaController;
+    private final CaptchaService captchaService; // P1-1: 替换 CaptchaController
     private final RedisTemplate<String, Object> redisTemplate;
     private final RabbitTemplate rabbitTemplate;
-    private final DefaultRedisScript<Long> stockDecrScript;
+    private final DefaultRedisScript<Long> seckillScript; // P0-3: 合并后的原子脚本
 
     private static final String STOCK_KEY = "seckill:stock:";
     private static final String ORDER_KEY = "seckill:order:";
     private static final String SECKILL_RESULT_KEY = "seckill:result:";
     private static final String SECKILL_PATH_KEY = "seckill:path:";
     private static final String PATH_SALT = "FlashSale@2026!";
+    /** 订单标记 TTL: 24小时 = 86400秒 */
+    private static final long ORDER_MARK_TTL_SECONDS = 24 * 3600;
 
     /** 内存标记：商品是否已售罄（减少Redis访问） */
     private final Map<Long, Boolean> stockOverMap = new ConcurrentHashMap<>();
 
     /**
      * 系统初始化：将秒杀商品库存加载到Redis
+     * P1-6 修复: 仅加载 status=1（进行中）的秒杀商品，避免浪费资源
      */
     @PostConstruct
     public void initSeckillStock() {
-        List<SeckillGoods> list = seckillGoodsMapper.selectList(null);
+        List<SeckillGoods> list = seckillGoodsMapper.selectList(
+                new LambdaQueryWrapper<SeckillGoods>()
+                        .eq(SeckillGoods::getStatus, 1));
         for (SeckillGoods sg : list) {
             redisTemplate.opsForValue().set(STOCK_KEY + sg.getId(), sg.getStockCount());
             stockOverMap.put(sg.getId(), false);
         }
-        log.info("秒杀库存预热完成, 共加载 {} 个秒杀商品", list.size());
+        log.info("秒杀库存预热完成, 共加载 {} 个进行中的秒杀商品", list.size());
     }
 
     // ========================= 安全防护层 =========================
 
     /**
      * 创建秒杀路径（验证码校验通过后）
+     * P1-1 修复: 调用 CaptchaService 替代 CaptchaController
      */
     public String createSeckillPath(Long userId, Long seckillGoodsId, int captchaAnswer) {
-        // 1. 验证验证码
-        boolean valid = captchaController.verifyCaptcha(userId, seckillGoodsId, captchaAnswer);
+        // 1. 验证验证码（通过 Service 层调用，而非 Controller）
+        boolean valid = captchaService.verifyCaptcha(userId, seckillGoodsId, captchaAnswer);
         if (!valid) {
             throw new BusinessException(ResultCode.SECKILL_CAPTCHA_ERROR);
         }
@@ -94,16 +107,14 @@ public class SeckillService {
 
     /**
      * 验证秒杀路径
+     * P0-2 修复: 使用原子的 getAndDelete 替代 get + delete 两步操作，
+     * 防止高并发下同一个 path 被多次验证通过（重放攻击）
      */
     public boolean validateSeckillPath(Long userId, Long seckillGoodsId, String path) {
         String key = SECKILL_PATH_KEY + userId + ":" + seckillGoodsId;
-        Object storedPath = redisTemplate.opsForValue().get(key);
-        if (storedPath == null) {
-            return false;
-        }
-        // 用后即删
-        redisTemplate.delete(key);
-        return path.equals(storedPath.toString());
+        // 原子操作：取值并删除（Spring Data Redis 2.6+ 支持）
+        Object storedPath = redisTemplate.opsForValue().getAndDelete(key);
+        return storedPath != null && path.equals(storedPath.toString());
     }
 
     // ========================= 秒杀核心逻辑 =========================
@@ -111,8 +122,8 @@ public class SeckillService {
     /**
      * 执行秒杀（异步）
      * 1. 内存标记判断
-     * 2. Redis预减库存
-     * 3. 判断重复秒杀
+     * 2. 校验秒杀商品及时间窗口
+     * 3. 【原子操作】Redis Lua: 重复判断 + 库存预减（P0-3 修复）
      * 4. 发送MQ消息
      */
     public void doSeckill(Long userId, Long seckillGoodsId) {
@@ -134,23 +145,26 @@ public class SeckillService {
             throw new BusinessException(ResultCode.SECKILL_ENDED);
         }
 
-        // 3. Redis判断是否重复秒杀（设置 24h TTL，避免永益占用）
+        // 3. 【P0-3 修复】原子 Lua 脚本: 重复秒杀判断 + 库存预减
+        // 将原来分离的 setIfAbsent + Lua decr 合并为单个原子操作
+        String stockKey = STOCK_KEY + seckillGoodsId;
         String orderKey = ORDER_KEY + userId + ":" + sg.getGoodsId();
-        Boolean isRepeat = redisTemplate.opsForValue().setIfAbsent(orderKey, "1", 24, TimeUnit.HOURS);
-        if (Boolean.FALSE.equals(isRepeat)) {
+        Long result = redisTemplate.execute(
+                seckillScript,
+                Arrays.asList(stockKey, orderKey),
+                ORDER_MARK_TTL_SECONDS);
+
+        if (result == null || result == 0) {
+            // 库存不足
+            stockOverMap.put(seckillGoodsId, true);
+            throw new BusinessException(ResultCode.SECKILL_STOCK_EMPTY);
+        }
+        if (result == -1) {
+            // 重复秒杀
             throw new BusinessException(ResultCode.SECKILL_REPEAT);
         }
 
-        // 4. Redis Lua 原子预减库存
-        Long result = redisTemplate.execute(stockDecrScript,
-                Collections.singletonList(STOCK_KEY + seckillGoodsId));
-        if (result == null || result == 0) {
-            stockOverMap.put(seckillGoodsId, true); // 标记售罄
-            redisTemplate.delete(orderKey); // 回滚重复标记
-            throw new BusinessException(ResultCode.SECKILL_STOCK_EMPTY);
-        }
-
-        // 5. 发送秒杀消息到MQ
+        // 4. 发送秒杀消息到MQ
         try {
             SeckillMessage message = new SeckillMessage();
             message.setUserId(userId);
@@ -161,7 +175,7 @@ public class SeckillService {
                     message);
             log.info("秒杀请求已入队: userId={}, seckillGoodsId={}", userId, seckillGoodsId);
         } catch (Exception e) {
-            log.error("MQ发送失败，回滚Redis库存: {}", e.getMessage());
+            log.error("MQ发送失败，回滚Redis库存和订单标记: {}", e.getMessage());
             // 回滚 Redis 库存
             redisTemplate.opsForValue().increment(STOCK_KEY + seckillGoodsId);
             // 清除重复秒杀标记
@@ -189,6 +203,16 @@ public class SeckillService {
     }
 
     /**
+     * P1-3 修复: 清除内存售罄标记
+     * 供 OrderService 在取消订单恢复库存后调用,
+     * 防止库存已恢复但内存标记仍为"售罄"导致后续请求被拒绝(少卖)
+     */
+    public void clearStockOverFlag(Long seckillGoodsId) {
+        stockOverMap.put(seckillGoodsId, false);
+        log.debug("已清除秒杀商品 {} 的内存售罄标记", seckillGoodsId);
+    }
+
+    /**
      * 真正执行秒杀（MQ消费者调用）
      */
     @Transactional(rollbackFor = Exception.class)
@@ -208,7 +232,7 @@ public class SeckillService {
             return;
         }
 
-        // 3. 再次检查是否重复秒杀（数据库层面）
+        // 3. 再次检查是否重复秒杀（数据库层面 — 最后一道防线）
         SeckillOrder existOrder = orderService.getSeckillOrder(userId, sg.getGoodsId());
         if (existOrder != null) {
             setResult(userId, seckillGoodsId, -1L);

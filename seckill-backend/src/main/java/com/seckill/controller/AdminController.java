@@ -15,6 +15,8 @@ import lombok.extern.slf4j.Slf4j;
 import org.springframework.data.redis.core.RedisTemplate;
 import org.springframework.web.bind.annotation.*;
 
+import jakarta.validation.Valid;
+
 import java.time.LocalDateTime;
 import java.util.*;
 
@@ -146,7 +148,7 @@ public class AdminController {
 
     @Operation(summary = "添加秒杀商品")
     @PostMapping("/goods")
-    public Result<Void> addSeckillGoods(@RequestBody com.seckill.dto.SeckillGoodsDTO dto) {
+    public Result<Void> addSeckillGoods(@Valid @RequestBody com.seckill.dto.SeckillGoodsDTO dto) {
         goodsService.addSeckillGoods(dto);
         return Result.success("添加成功", null);
     }
@@ -154,7 +156,7 @@ public class AdminController {
     @Operation(summary = "更新秒杀商品")
     @PutMapping("/goods/{seckillGoodsId}")
     public Result<Void> updateSeckillGoods(@PathVariable Long seckillGoodsId,
-            @RequestBody com.seckill.dto.SeckillGoodsDTO dto) {
+            @Valid @RequestBody com.seckill.dto.SeckillGoodsDTO dto) {
         goodsService.updateSeckillGoods(seckillGoodsId, dto);
         return Result.success("更新成功", null);
     }

@@ -4,6 +4,7 @@ import com.seckill.common.Result;
 import com.seckill.common.ResultCode;
 import jakarta.validation.ConstraintViolation;
 import jakarta.validation.ConstraintViolationException;
+import org.springframework.http.converter.HttpMessageNotReadableException;
 import lombok.extern.slf4j.Slf4j;
 import org.springframework.http.HttpStatus;
 import org.springframework.validation.BindException;
@@ -68,6 +69,16 @@ public class GlobalExceptionHandler {
                 .collect(Collectors.joining("; "));
         log.warn("约束违反: {}", message);
         return Result.error(ResultCode.BAD_REQUEST.getCode(), message);
+    }
+
+    /**
+     * 处理请求体不可读异常（如 JSON 格式错误）
+     */
+    @ExceptionHandler(HttpMessageNotReadableException.class)
+    @ResponseStatus(HttpStatus.BAD_REQUEST)
+    public Result<Void> handleHttpMessageNotReadable(HttpMessageNotReadableException e) {
+        log.warn("请求体解析失败: {}", e.getMessage());
+        return Result.error(ResultCode.BAD_REQUEST.getCode(), "请求数据格式错误");
     }
 
     /**

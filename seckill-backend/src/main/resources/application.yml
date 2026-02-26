@@ -10,9 +10,9 @@ spring:
   # ==================== 数据源配置 ====================
   datasource:
     driver-class-name: com.mysql.cj.jdbc.Driver
-    url: jdbc:mysql://192.168.150.103:3306/seckill?useUnicode=true&characterEncoding=utf-8&useSSL=false&serverTimezone=Asia/Shanghai&allowPublicKeyRetrieval=true&nullCatalogMeansCurrent=true
-    username: root
-    password: 123456
+    url: ${DB_URL:jdbc:mysql://192.168.150.103:3306/seckill?useUnicode=true&characterEncoding=utf-8&useSSL=false&serverTimezone=Asia/Shanghai&allowPublicKeyRetrieval=true&nullCatalogMeansCurrent=true}
+    username: ${DB_USERNAME:root}
+    password: ${DB_PASSWORD:123456}
     hikari:
       minimum-idle: 5
       maximum-pool-size: 20
@@ -23,9 +23,9 @@ spring:
   # ==================== Redis配置 ====================
   data:
     redis:
-      host: 192.168.150.103
-      port: 6379
-      password:
+      host: ${REDIS_HOST:192.168.150.103}
+      port: ${REDIS_PORT:6379}
+      password: ${REDIS_PASSWORD:}
       database: 1
       lettuce:
         pool:
@@ -36,10 +36,10 @@ spring:
 
   # ==================== RabbitMQ配置 ====================
   rabbitmq:
-    host: 192.168.150.103
-    port: 5672
-    username: admin
-    password: 123456
+    host: ${RABBITMQ_HOST:192.168.150.103}
+    port: ${RABBITMQ_PORT:5672}
+    username: ${RABBITMQ_USERNAME:admin}
+    password: ${RABBITMQ_PASSWORD:123456}
     virtual-host: /
     listener:
       simple:
@@ -62,7 +62,7 @@ mybatis-plus:
   mapper-locations: classpath:mapper/**/*.xml
   configuration:
     map-underscore-to-camel-case: true
-    log-impl: org.apache.ibatis.logging.stdout.StdOutImpl
+    log-impl: org.apache.ibatis.logging.slf4j.Slf4jImpl
   global-config:
     db-config:
       id-type: auto
@@ -72,7 +72,7 @@ mybatis-plus:
 
 # ==================== JWT配置 ====================
 jwt:
-  secret: seckill-system-jwt-secret-key-2024-must-be-at-least-256-bits-long
+  secret: ${JWT_SECRET:seckill-system-jwt-secret-key-2024-must-be-at-least-256-bits-long}
   expiration: 86400000  # 24小时(毫秒)
   header: Authorization
   prefix: "Bearer "

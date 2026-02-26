@@ -3,6 +3,7 @@ package com.seckill.controller;
 import com.seckill.annotation.RateLimit;
 import com.seckill.common.Result;
 import com.seckill.utils.UserContext;
+import com.seckill.service.CaptchaService;
 import io.swagger.v3.oas.annotations.Operation;
 import io.swagger.v3.oas.annotations.tags.Tag;
 import lombok.RequiredArgsConstructor;
@@ -31,6 +32,7 @@ import java.util.concurrent.TimeUnit;
 public class CaptchaController {
 
     private final RedisTemplate<String, Object> redisTemplate;
+    private final CaptchaService captchaService;
 
     private static final String CAPTCHA_KEY = "captcha:seckill:";
     private static final int WIDTH = 160;
@@ -86,16 +88,10 @@ public class CaptchaController {
     }
 
     /**
-     * 验证验证码
+     * 验证验证码（委托给 CaptchaService，保持向后兼容）
      */
     public boolean verifyCaptcha(Long userId, Long seckillGoodsId, int userAnswer) {
-        String key = CAPTCHA_KEY + userId + ":" + seckillGoodsId;
-        Object stored = redisTemplate.opsForValue().get(key);
-        if (stored == null) {
-            return false;
-        }
-        redisTemplate.delete(key); // 用后即删
-        return Integer.parseInt(stored.toString()) == userAnswer;
+        return captchaService.verifyCaptcha(userId, seckillGoodsId, userAnswer);
     }
 
     /**

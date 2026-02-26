@@ -64,6 +64,7 @@ public class GoodsService extends ServiceImpl<GoodsMapper, Goods> {
 
     /**
      * 获取秒杀商品详情
+     * P1-7 修复: 对不存在的商品缓存空值30秒，防止缓存穿透
      */
     public SeckillGoodsVo getSeckillGoodsDetail(Long seckillGoodsId) {
         String key = GOODS_DETAIL_KEY + seckillGoodsId;
@@ -71,16 +72,25 @@ public class GoodsService extends ServiceImpl<GoodsMapper, Goods> {
         // 先从缓存获取
         Object cached = redisTemplate.opsForValue().get(key);
         if (cached != null) {
+            // 哨兵值""表示商品不存在，直接返回null不穿透DB
+            if (cached instanceof String && "".equals(cached)) {
+                return null;
+            }
             return (SeckillGoodsVo) cached;
         }
 
         SeckillGoods sg = seckillGoodsMapper.selectById(seckillGoodsId);
-        if (sg == null)
+        if (sg == null) {
+            // 缓存空值30秒，防止攻击者反复查询不存在的ID穿透DB
+            redisTemplate.opsForValue().set(key, "", 30, TimeUnit.SECONDS);
             return null;
+        }
 
         Goods goods = getById(sg.getGoodsId());
-        if (goods == null)
+        if (goods == null) {
+            redisTemplate.opsForValue().set(key, "", 30, TimeUnit.SECONDS);
             return null;
+        }
 
         SeckillGoodsVo vo = buildSeckillGoodsVo(goods, sg);
 

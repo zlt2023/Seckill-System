@@ -14,8 +14,9 @@ import org.springframework.lang.NonNull;
 import org.springframework.stereotype.Component;
 import org.springframework.web.method.HandlerMethod;
 import org.springframework.web.servlet.HandlerInterceptor;
+import java.util.Collections;
 
-import java.util.concurrent.TimeUnit;
+import org.springframework.data.redis.core.script.DefaultRedisScript;
 
 /**
  * 限流拦截器 - 基于Redis实现计数器限流
@@ -27,6 +28,7 @@ public class RateLimitInterceptor implements HandlerInterceptor {
 
     private final RedisTemplate<String, Object> redisTemplate;
     private final ObjectMapper objectMapper;
+    private final DefaultRedisScript<Long> rateLimitScript;
 
     private static final String RATE_LIMIT_KEY = "rate_limit:";
 
@@ -56,14 +58,13 @@ public class RateLimitInterceptor implements HandlerInterceptor {
             key = RATE_LIMIT_KEY + request.getRequestURI() + ":" + ip;
         }
 
-        // Redis计数器限流
-        Long count = redisTemplate.opsForValue().increment(key, 1);
+        // 【P0-1 修复】使用 Lua 脚本原子计数+设置过期
+        Long count = redisTemplate.execute(
+                rateLimitScript,
+                Collections.singletonList(key),
+                (long) rateLimit.seconds());
         if (count == null) {
             return true;
-        }
-
-        if (count == 1) {
-            redisTemplate.expire(key, rateLimit.seconds(), TimeUnit.SECONDS);
         }
 
         if (count > rateLimit.maxCount()) {

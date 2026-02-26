@@ -11,6 +11,7 @@ import com.seckill.mapper.SeckillGoodsMapper;
 import com.seckill.mapper.SeckillOrderMapper;
 import lombok.RequiredArgsConstructor;
 import lombok.extern.slf4j.Slf4j;
+import org.springframework.context.annotation.Lazy;
 import org.springframework.data.redis.core.RedisTemplate;
 import org.springframework.stereotype.Service;
 import org.springframework.transaction.annotation.Transactional;
@@ -31,6 +32,8 @@ public class OrderService extends ServiceImpl<OrderInfoMapper, OrderInfo> {
     private final SeckillOrderMapper seckillOrderMapper;
     private final SeckillGoodsMapper seckillGoodsMapper;
     private final RedisTemplate<String, Object> redisTemplate;
+    /** P1-3: 使用 @Lazy 打破 SeckillService ↔ OrderService 的循环依赖 */
+    private final @Lazy SeckillService seckillService;
 
     private static final String STOCK_KEY = "seckill:stock:";
     private static final String ORDER_KEY = "seckill:order:";
@@ -69,6 +72,7 @@ public class OrderService extends ServiceImpl<OrderInfoMapper, OrderInfo> {
 
     /**
      * 模拟支付
+     * P2-8 修复: 使用条件更新(WHERE status=0)替代先查再改，避免并发下重复支付
      */
     @Transactional(rollbackFor = Exception.class)
     public void payOrder(Long userId, Long orderId) {
@@ -79,9 +83,17 @@ public class OrderService extends ServiceImpl<OrderInfoMapper, OrderInfo> {
         if (order.getStatus() != 0) {
             throw new BusinessException(ResultCode.ORDER_ALREADY_PAID);
         }
-        order.setStatus(1); // 已支付
-        order.setPayTime(LocalDateTime.now());
-        updateById(order);
+        // 原子条件更新: 只有状态为"未支付(0)"才更新为"已支付(1)"
+        boolean updated = update()
+                .set("status", 1)
+                .set("pay_time", LocalDateTime.now())
+                .eq("id", orderId)
+                .eq("user_id", userId)
+                .eq("status", 0)
+                .update();
+        if (!updated) {
+            throw new BusinessException("支付失败，订单状态已变更");
+        }
         log.info("订单支付成功: orderId={}, userId={}", orderId, userId);
     }
 
@@ -139,6 +151,11 @@ public class OrderService extends ServiceImpl<OrderInfoMapper, OrderInfo> {
         // 5. 清除秒杀结果缓存
         String resultKey = SECKILL_RESULT_KEY + order.getUserId() + ":" + order.getSeckillGoodsId();
         redisTemplate.delete(resultKey);
+
+        // 6. P1-3 修复: 清除内存中的售罄标记，否则库存恢复后新请求仍会被拒绝
+        if (order.getSeckillGoodsId() != null) {
+            seckillService.clearStockOverFlag(order.getSeckillGoodsId());
+        }
     }
 
     /**
