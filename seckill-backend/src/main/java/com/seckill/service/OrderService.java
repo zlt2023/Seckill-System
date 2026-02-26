@@ -10,7 +10,9 @@ import com.seckill.mapper.OrderInfoMapper;
 import com.seckill.mapper.SeckillGoodsMapper;
 import com.seckill.mapper.SeckillOrderMapper;
 import lombok.RequiredArgsConstructor;
+import lombok.Setter;
 import lombok.extern.slf4j.Slf4j;
+import org.springframework.beans.factory.annotation.Autowired;
 import org.springframework.context.annotation.Lazy;
 import org.springframework.data.redis.core.RedisTemplate;
 import org.springframework.stereotype.Service;
@@ -32,8 +34,12 @@ public class OrderService extends ServiceImpl<OrderInfoMapper, OrderInfo> {
     private final SeckillOrderMapper seckillOrderMapper;
     private final SeckillGoodsMapper seckillGoodsMapper;
     private final RedisTemplate<String, Object> redisTemplate;
-    /** P1-3: 使用 @Lazy 打破 SeckillService ↔ OrderService 的循环依赖 */
-    private final @Lazy SeckillService seckillService;
+
+    /**
+     * P1-3: @Lazy + setter 注入打破循环依赖（Lombok 构造器不传播 @Lazy）
+     */
+    @Setter(onMethod_ = { @Autowired, @Lazy })
+    private SeckillService seckillService;
 
     private static final String STOCK_KEY = "seckill:stock:";
     private static final String ORDER_KEY = "seckill:order:";
