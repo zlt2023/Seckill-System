@@ -122,14 +122,11 @@ WHERE status = 1 AND end_date < NOW() AND deleted = 0;
 -- 用户表
 t_user (id, username[UNIQUE], phone[UNIQUE], password, salt, nickname, avatar, role, status, deleted)
 
--- 商品表
-t_goods (id, goods_name, goods_title, goods_img, goods_detail, goods_price, goods_stock, status, deleted)
-
--- 秒杀商品表
-t_seckill_goods (id, goods_id[IDX], seckill_price, stock_count, start_date, end_date, status, deleted)
+-- 秒杀商品表 (由原先t_goods及t_seckill_goods合并归一，移除普通库存，以stock_count作为唯一库存源)
+t_seckill_goods (id, goods_name, goods_title, goods_img, goods_detail, goods_price, seckill_price, stock_count, start_date, end_date, goods_status, seckill_status, create_time, update_time, deleted)
 
 -- 订单表
-t_order_info (id, user_id[IDX], goods_id[IDX], seckill_goods_id, goods_name, goods_count, goods_price, status, pay_time, deleted)
+t_order_info (id, user_id[IDX], goods_id[IDX], goods_name, goods_count, goods_price, status, pay_time, deleted)
 -- status: 0=未支付 1=已支付 2=已发货 3=已收货 4=已取消 5=已退款
 
 -- 秒杀订单表（去重）
@@ -365,3 +362,12 @@ Redis 是内存数据，存在宕机风险（即使有持久化，也可能丢�
 | ⚠️ P1 | P1-7 | 缓存穿透无防护 | 空值哨兵缓存 30s |
 | 📌 P2 | P2-5 | SQL 日志 StdOut 输出 | 改为 SLF4J |
 | 📌 P2 | P2-8 | 支付先查再改非原子 | 条件更新 `WHERE status=0` |
+
+---
+
+## 🏗️ 架构重构记录 (v1.2.0)
+
+1. **统一商品信息流**: 彻底废弃分离的 `t_goods` 表，所有商品核心信息、商品上架状态 `goods_status` 和活动状态 `seckill_status` 熔合进 `t_seckill_goods` 单表。原先繁琐的普通库存被淘汰，统一采用 `stock_count`。
+2. **清除强干扰操作**: 完全移除后台管理系统的“重置库存”功能，从前端组件到底层逻辑全面剥离，切断管理人员强行改库干扰正常秒杀进度并导致数据混乱的根源。
+3. **修复致命的数据一致性回滚**: `executeSeckill` 的 MySQL 回滚现在能自动触发 `handleSeckillFail`，当 MQ 发生执行异常时，将 Redis 中已经被扣减的对应库存进行等量反还，修复了原先异常引起“少卖”的隐患。
+4. **追加和清理式的缓存守护**: 将 `SeckillStatusScheduler` 修改为增量追加式 `incrementalInitSeckillStock (SETNX)`，避免覆盖正在秒杀的最新缓存。并自动在活动定时结束时清空释放其残留在 Redis 内的库存、详情凭证以及内存变量。

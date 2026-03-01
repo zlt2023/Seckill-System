@@ -141,13 +141,18 @@ public class OrderService extends ServiceImpl<OrderInfoMapper, OrderInfo> {
         order.setUpdateTime(LocalDateTime.now());
         updateById(order);
 
+        // 1.5 删除对应的唯一的秒杀排他订单记录(seckill_order)，确保用户取消后还可以重新下单！
+        seckillOrderMapper.delete(
+                new LambdaQueryWrapper<SeckillOrder>()
+                        .eq(SeckillOrder::getOrderId, order.getId()));
+
         // 2. 恢复数据库库存
-        if (order.getSeckillGoodsId() != null) {
-            seckillGoodsMapper.restoreStock(order.getSeckillGoodsId());
+        if (order.getGoodsId() != null) {
+            seckillGoodsMapper.restoreStock(order.getGoodsId());
         }
 
         // 3. 恢复Redis库存
-        String stockKey = STOCK_KEY + order.getSeckillGoodsId();
+        String stockKey = STOCK_KEY + order.getGoodsId();
         redisTemplate.opsForValue().increment(stockKey, 1);
 
         // 4. 清除秒杀相关Redis标记（允许用户再次秒杀）
@@ -155,12 +160,12 @@ public class OrderService extends ServiceImpl<OrderInfoMapper, OrderInfo> {
         redisTemplate.delete(orderKey);
 
         // 5. 清除秒杀结果缓存
-        String resultKey = SECKILL_RESULT_KEY + order.getUserId() + ":" + order.getSeckillGoodsId();
+        String resultKey = SECKILL_RESULT_KEY + order.getUserId() + ":" + order.getGoodsId();
         redisTemplate.delete(resultKey);
 
         // 6. P1-3 修复: 清除内存中的售罄标记，否则库存恢复后新请求仍会被拒绝
-        if (order.getSeckillGoodsId() != null) {
-            seckillService.clearStockOverFlag(order.getSeckillGoodsId());
+        if (order.getGoodsId() != null) {
+            seckillService.clearStockOverFlag(order.getGoodsId());
         }
     }
 

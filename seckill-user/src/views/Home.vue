@@ -155,7 +155,11 @@ function formatCountdown(seconds: number) {
 .hero {
   position: relative;
   text-align: center;
-  padding: 60px 20px 40px;
+  padding: 80px 20px;
+  background: var(--bg-card);
+  border-radius: var(--radius-xl);
+  margin-bottom: 40px;
+  box-shadow: 0 4px 20px rgba(0, 0, 0, 0.03);
   overflow: hidden;
 }
 
@@ -163,9 +167,14 @@ function formatCountdown(seconds: number) {
   position: absolute;
   inset: 0;
   background:
-    radial-gradient(ellipse at top, rgba(99, 102, 241, 0.08) 0%, transparent 60%),
-    radial-gradient(ellipse at bottom right, rgba(244, 63, 94, 0.06) 0%, transparent 60%);
-  z-index: -1;
+    radial-gradient(ellipse at top, rgba(244, 63, 94, 0.08) 0%, transparent 70%),
+    radial-gradient(ellipse at bottom right, rgba(244, 63, 94, 0.04) 0%, transparent 70%);
+  z-index: 0;
+}
+
+.hero-content {
+  position: relative;
+  z-index: 1;
 }
 
 .hero-title {
@@ -218,7 +227,7 @@ function formatCountdown(seconds: number) {
 
 .goods-grid {
   display: grid;
-  grid-template-columns: repeat(auto-fill, minmax(300px, 1fr));
+  grid-template-columns: repeat(auto-fill, minmax(280px, 1fr));
   gap: 24px;
 }
 
@@ -230,7 +239,7 @@ function formatCountdown(seconds: number) {
 
 .goods-img-wrapper {
   position: relative;
-  height: 220px;
+  height: 240px;
   overflow: hidden;
   background: #f1f5f9;
 }
@@ -333,7 +342,6 @@ function formatCountdown(seconds: number) {
   .hero-title {
     font-size: 1.8rem;
   }
-
   .goods-grid {
     grid-template-columns: 1fr;
   }

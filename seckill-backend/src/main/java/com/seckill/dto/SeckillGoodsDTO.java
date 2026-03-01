@@ -26,10 +26,6 @@ public class SeckillGoodsDTO {
     @Positive(message = "商品原价必须大于0")
     private BigDecimal goodsPrice;
 
-    @NotNull(message = "商品库存不能为空")
-    @Min(value = 0, message = "商品库存不能为负数")
-    private Integer goodsStock;
-
     @NotNull(message = "秒杀价不能为空")
     @Positive(message = "秒杀价必须大于0")
     private BigDecimal seckillPrice;
@@ -44,5 +40,7 @@ public class SeckillGoodsDTO {
     @NotNull(message = "秒杀结束时间不能为空")
     private LocalDateTime endDate;
 
-    private Integer status;
+    private Integer status; // 普通商品上架状态
+
+    private Integer seckillStatus; // 秒杀活动发布状态
 }

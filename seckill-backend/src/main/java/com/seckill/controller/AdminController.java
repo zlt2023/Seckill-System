@@ -2,7 +2,6 @@ package com.seckill.controller;
 
 import com.baomidou.mybatisplus.core.conditions.query.LambdaQueryWrapper;
 import com.seckill.common.Result;
-import com.seckill.entity.Goods;
 import com.seckill.entity.OrderInfo;
 import com.seckill.entity.SeckillGoods;
 import com.seckill.mapper.SeckillGoodsMapper;
@@ -53,7 +52,8 @@ public class AdminController {
         int totalGoods = allSeckillGoods.size();
         LocalDateTime now = LocalDateTime.now();
         long activeGoods = allSeckillGoods.stream()
-                .filter(sg -> sg.getStatus() != 0 // 未发布的不算
+                .filter(sg -> sg.getSeckillStatus() != 0 // 未发布的不算
+                        && sg.getGoodsStatus() != 0 // 下架的不算
                         && sg.getStartDate().isBefore(now)
                         && sg.getEndDate().isAfter(now))
                 .count();
@@ -82,18 +82,17 @@ public class AdminController {
         List<Map<String, Object>> stockDetails = new ArrayList<>();
         for (SeckillGoods sg : allSeckillGoods) {
             Map<String, Object> item = new LinkedHashMap<>();
-            Goods goods = goodsService.getById(sg.getGoodsId());
             item.put("seckillGoodsId", sg.getId());
-            item.put("goodsName", goods != null ? goods.getGoodsName() : "未知");
+            item.put("goodsName", sg.getGoodsName() != null ? sg.getGoodsName() : "未知");
             item.put("dbStock", sg.getStockCount());
             Object redisStock = redisTemplate.opsForValue().get(STOCK_KEY + sg.getId());
             item.put("redisStock", redisStock != null ? Integer.parseInt(redisStock.toString()) : 0);
             item.put("seckillPrice", sg.getSeckillPrice());
             item.put("startDate", sg.getStartDate());
             item.put("endDate", sg.getEndDate());
-            // 动态计算实时状态（不依赖数据库静态 status 字段）
+            // 动态计算实时状态（不依赖数据库静态 seckill_status 字段）
             int realStatus;
-            if (sg.getStatus() == 0) {
+            if (sg.getSeckillStatus() == 0) {
                 realStatus = 0; // 管理员设为未发布
             } else if (now.isBefore(sg.getStartDate())) {
                 realStatus = 3; // 未到开始时间（即将开始）
@@ -103,7 +102,8 @@ public class AdminController {
                 realStatus = 1; // 进行中
             }
             item.put("status", realStatus);
-            item.put("dbStatus", sg.getStatus()); // 保留数据库原始字段供参考
+            item.put("dbStatus", sg.getSeckillStatus()); // t_seckill_goods.seckill_status
+            item.put("goodsStatus", sg.getGoodsStatus() != null ? sg.getGoodsStatus() : 0); // t_seckill_goods.goods_status
             stockDetails.add(item);
         }
         dashboard.put("stockDetails", stockDetails);
@@ -112,25 +112,6 @@ public class AdminController {
         dashboard.put("serverTime", LocalDateTime.now());
 
         return Result.success(dashboard);
-    }
-
-    @Operation(summary = "重置秒杀活动库存")
-    @PostMapping("/reset-stock/{seckillGoodsId}")
-    public Result<Void> resetStock(@PathVariable Long seckillGoodsId,
-            @RequestParam(defaultValue = "100") Integer stock) {
-        // 更新数据库
-        SeckillGoods sg = seckillGoodsMapper.selectById(seckillGoodsId);
-        if (sg == null) {
-            return Result.error("秒杀商品不存在");
-        }
-        sg.setStockCount(stock);
-        seckillGoodsMapper.updateById(sg);
-
-        // 更新Redis并清除本地售罄标记
-        seckillService.resetStock(seckillGoodsId, stock);
-
-        log.info("库存重置: seckillGoodsId={}, newStock={}", seckillGoodsId, stock);
-        return Result.success("库存重置成功", null);
     }
 
     @Operation(summary = "获取所有订单列表(管理员)")
@@ -158,6 +139,7 @@ public class AdminController {
     public Result<Void> updateSeckillGoods(@PathVariable Long seckillGoodsId,
             @Valid @RequestBody com.seckill.dto.SeckillGoodsDTO dto) {
         goodsService.updateSeckillGoods(seckillGoodsId, dto);
+        seckillService.reloadSingleSeckillStock(seckillGoodsId);
         return Result.success("更新成功", null);
     }
 

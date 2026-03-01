@@ -41,6 +41,14 @@ public class SeckillConsumer {
             channel.basicAck(deliveryTag, false);
         } catch (Exception e) {
             log.error("秒杀消息处理失败: {}", e.getMessage(), e);
+            // 这里非常核心：如果 executeSeckill 方法（有@Transactional注解）抛出异常发生回滚
+            // Redis 中的库存已经被预扣除了，排队成功的标记也写进去了
+            // 所以我们需要通过 handleSeckillFail 将 Redis 的标记和库存全数回退，保证数据一致性（防止少卖）
+            try {
+                seckillService.handleSeckillFail(message.getUserId(), message.getSeckillGoodsId());
+            } catch (Exception compensationError) {
+                log.error("补偿还原秒杀库存失败: {}", compensationError.getMessage(), compensationError);
+            }
             // 拒绝并不重新入队（避免无限循环）
             channel.basicNack(deliveryTag, false, false);
         }

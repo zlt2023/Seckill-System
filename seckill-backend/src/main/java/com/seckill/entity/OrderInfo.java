@@ -20,11 +20,8 @@ public class OrderInfo implements Serializable {
     /** 用户ID */
     private Long userId;
 
-    /** 商品ID */
+    /** 商品ID (关联 t_seckill_goods.id) */
     private Long goodsId;
-
-    /** 秒杀商品ID */
-    private Long seckillGoodsId;
 
     /** 收货地址ID */
     private Long deliveryAddrId;

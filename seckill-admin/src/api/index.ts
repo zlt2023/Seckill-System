@@ -18,9 +18,6 @@ export const adminApi = {
     dashboard: () =>
         request.get('/admin/dashboard'),
 
-    /** 重置秒杀库存 */
-    resetStock: (seckillGoodsId: number, stock: number) =>
-        request.post(`/admin/reset-stock/${seckillGoodsId}?stock=${stock}`),
 
     /** 获取全量订单列表 */
     orders: (status?: number) =>

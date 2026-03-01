@@ -5,7 +5,6 @@ import com.baomidou.mybatisplus.core.conditions.query.LambdaQueryWrapper;
 import com.seckill.common.ResultCode;
 import com.seckill.config.RabbitMQConfig;
 import com.seckill.dto.SeckillMessage;
-import com.seckill.entity.Goods;
 import com.seckill.entity.OrderInfo;
 import com.seckill.entity.SeckillGoods;
 import com.seckill.entity.SeckillOrder;
@@ -25,6 +24,7 @@ import java.time.LocalDateTime;
 import java.util.Arrays;
 import java.util.List;
 import java.util.Map;
+import java.util.Set;
 import java.util.UUID;
 import java.util.concurrent.ConcurrentHashMap;
 import java.util.concurrent.TimeUnit;
@@ -47,7 +47,6 @@ public class SeckillService {
 
     private final SeckillGoodsMapper seckillGoodsMapper;
     private final SeckillOrderMapper seckillOrderMapper;
-    private final GoodsService goodsService;
     private final OrderService orderService;
     private final CaptchaService captchaService; // P1-1: 替换 CaptchaController
     private final RedisTemplate<String, Object> redisTemplate;
@@ -71,14 +70,66 @@ public class SeckillService {
      */
     @PostConstruct
     public void initSeckillStock() {
+        // 先清理 Redis 中现有的秒杀库存，防止状态已变及脏数据残留
+        Set<String> keys = redisTemplate.keys(STOCK_KEY + "*");
+        if (keys != null && !keys.isEmpty()) {
+            redisTemplate.delete(keys);
+        }
+
+        // 清理本地内存标记
+        // 3. 重新从数据库按最新状态加载
         List<SeckillGoods> list = seckillGoodsMapper.selectList(
                 new LambdaQueryWrapper<SeckillGoods>()
-                        .eq(SeckillGoods::getStatus, 1));
+                        .eq(SeckillGoods::getSeckillStatus, 1)
+                        .eq(SeckillGoods::getGoodsStatus, 1));
         for (SeckillGoods sg : list) {
             redisTemplate.opsForValue().set(STOCK_KEY + sg.getId(), sg.getStockCount());
             stockOverMap.put(sg.getId(), false);
         }
-        log.info("秒杀库存预热完成, 共加载 {} 个进行中的秒杀商品", list.size());
+        int oldKeys = keys != null ? keys.size() : 0;
+        log.info("秒杀库存预热完成, 共清理 {} 个旧库存, 加载 {} 个进行中的秒杀商品", oldKeys, list.size());
+    }
+
+    /**
+     * 追加初始化缓存（供后台定时任务调度使用）
+     * 核心区别：绝对不能删除 Redis 旧数据，也绝对不能覆盖 Redis 中已存在的数据！
+     * （如果在运行途中覆盖，就会把正在秒杀扣减的 Redis 最新库存用 DB 里的滞后库存覆盖掉，引发重卖）
+     */
+    public void incrementalInitSeckillStock() {
+        List<SeckillGoods> list = seckillGoodsMapper.selectList(
+                new LambdaQueryWrapper<SeckillGoods>()
+                        .eq(SeckillGoods::getSeckillStatus, 1)
+                        .eq(SeckillGoods::getGoodsStatus, 1));
+        int count = 0;
+        for (SeckillGoods sg : list) {
+            // setIfAbsent (即 Redis 的 SETNX)
+            // 只有当 Redis 中不存在该商品库存记录时，才从 DB 捞出来初始化。
+            Boolean absent = redisTemplate.opsForValue().setIfAbsent(STOCK_KEY + sg.getId(), sg.getStockCount());
+            if (Boolean.TRUE.equals(absent)) {
+                stockOverMap.put(sg.getId(), false);
+                count++;
+            }
+        }
+        if (count > 0) {
+            log.info("定时任务追加预热了 {} 个新活动商品的库存到Redis", count);
+        }
+    }
+
+    // ========================= 缓存与状态刷新 =========================
+
+    /**
+     * 单个强制刷新：下架后重新上架更新Redis
+     */
+    public void reloadSingleSeckillStock(Long seckillGoodsId) {
+        SeckillGoods sg = seckillGoodsMapper.selectById(seckillGoodsId);
+        if (sg != null && sg.getSeckillStatus() == 1 && sg.getGoodsStatus() == 1) {
+            redisTemplate.opsForValue().set(STOCK_KEY + sg.getId(), sg.getStockCount());
+            stockOverMap.put(sg.getId(), false);
+            log.info("手动刷新缓存：下架重新上架，商品 {} 缓存与售罄标记已重置", sg.getId());
+        } else {
+            redisTemplate.delete(STOCK_KEY + seckillGoodsId);
+            stockOverMap.put(seckillGoodsId, true); // 不允许抢了
+        }
     }
 
     // ========================= 安全防护层 =========================
@@ -134,8 +185,11 @@ public class SeckillService {
 
         // 2. 校验秒杀商品及时间窗口
         SeckillGoods sg = seckillGoodsMapper.selectById(seckillGoodsId);
-        if (sg == null || sg.getStatus() == 0) {
+        if (sg == null) {
             throw new BusinessException(ResultCode.GOODS_NOT_FOUND);
+        }
+        if (sg.getGoodsStatus() != 1 || sg.getSeckillStatus() != 1) {
+            throw new BusinessException("该商品未能参与秒杀活动，无法被抢购");
         }
         LocalDateTime now = LocalDateTime.now();
         if (now.isBefore(sg.getStartDate())) {
@@ -148,7 +202,7 @@ public class SeckillService {
         // 3. 【P0-3 修复】原子 Lua 脚本: 重复秒杀判断 + 库存预减
         // 将原来分离的 setIfAbsent + Lua decr 合并为单个原子操作
         String stockKey = STOCK_KEY + seckillGoodsId;
-        String orderKey = ORDER_KEY + userId + ":" + sg.getGoodsId();
+        String orderKey = ORDER_KEY + userId + ":" + seckillGoodsId;
         Long result = redisTemplate.execute(
                 seckillScript,
                 Arrays.asList(stockKey, orderKey),
@@ -187,22 +241,6 @@ public class SeckillService {
     }
 
     /**
-     * 重置库存 (供管理后台使用)
-     * 同时更新DB、Redis和清除本地售罄标记
-     */
-    public void resetStock(Long seckillGoodsId, Integer stockCount) {
-        // 1. 更新 Redis
-        redisTemplate.opsForValue().set(STOCK_KEY + seckillGoodsId, stockCount);
-        // 2. 清除本地售罄标记
-        stockOverMap.put(seckillGoodsId, false);
-        // 3. 清除商品详情缓存和列表缓存，确保前端能看到最新库存
-        redisTemplate.delete("seckill:goods:detail:" + seckillGoodsId);
-        redisTemplate.delete("seckill:goods:list");
-
-        log.info("秒杀商品 {} 库存已重置为 {}, 本地售罄标记和缓存已清除", seckillGoodsId, stockCount);
-    }
-
-    /**
      * P1-3 修复: 清除内存售罄标记
      * 供 OrderService 在取消订单恢复库存后调用,
      * 防止库存已恢复但内存标记仍为"售罄"导致后续请求被拒绝(少卖)
@@ -217,10 +255,17 @@ public class SeckillService {
      */
     @Transactional(rollbackFor = Exception.class)
     public void executeSeckill(Long userId, Long seckillGoodsId) {
-        // 1. 校验秒杀商品
+        // 1. 校验秒杀商品状态和库存
         SeckillGoods sg = seckillGoodsMapper.selectById(seckillGoodsId);
         if (sg == null || sg.getStockCount() <= 0) {
-            setResult(userId, seckillGoodsId, -1L);
+            handleSeckillFail(userId, seckillGoodsId);
+            return;
+        }
+
+        // 如果消费此条消息时，商品被管理员下架或活动状态出错，也作为失败处理
+        if (sg.getGoodsStatus() != 1 || sg.getSeckillStatus() != 1) {
+            log.warn("秒杀消费时商品已下架或活动不处于进行中: userId={}, seckillGoodsId={}", userId, seckillGoodsId);
+            handleSeckillFail(userId, seckillGoodsId);
             return;
         }
 
@@ -228,33 +273,31 @@ public class SeckillService {
         LocalDateTime now = LocalDateTime.now();
         if (now.isAfter(sg.getEndDate())) {
             log.warn("秒杀消费时已超过活动结束时间: userId={}, seckillGoodsId={}", userId, seckillGoodsId);
-            setResult(userId, seckillGoodsId, -1L);
+            handleSeckillFail(userId, seckillGoodsId);
             return;
         }
 
         // 3. 再次检查是否重复秒杀（数据库层面 — 最后一道防线）
-        SeckillOrder existOrder = orderService.getSeckillOrder(userId, sg.getGoodsId());
+        SeckillOrder existOrder = orderService.getSeckillOrder(userId, seckillGoodsId);
         if (existOrder != null) {
+            // 已有订单，不必再次删除标记，仅退回扣减错的库存份额，设为失败
             setResult(userId, seckillGoodsId, -1L);
+            redisTemplate.opsForValue().increment(STOCK_KEY + seckillGoodsId);
             return;
         }
 
         // 4. 数据库减库存 (乐观锁: stock_count > 0)
         int affectedRows = seckillGoodsMapper.reduceStock(seckillGoodsId);
         if (affectedRows == 0) {
-            setResult(userId, seckillGoodsId, -1L);
+            handleSeckillFail(userId, seckillGoodsId);
             return;
         }
-
-        // 5. 获取商品信息
-        Goods goods = goodsService.getById(sg.getGoodsId());
 
         // 6. 创建订单
         OrderInfo order = new OrderInfo();
         order.setUserId(userId);
-        order.setGoodsId(sg.getGoodsId());
-        order.setSeckillGoodsId(seckillGoodsId);
-        order.setGoodsName(goods.getGoodsName());
+        order.setGoodsId(seckillGoodsId);
+        order.setGoodsName(sg.getGoodsName());
         order.setGoodsCount(1);
         order.setGoodsPrice(sg.getSeckillPrice());
         order.setStatus(0); // 未支付
@@ -265,7 +308,7 @@ public class SeckillService {
         SeckillOrder seckillOrder = new SeckillOrder();
         seckillOrder.setUserId(userId);
         seckillOrder.setOrderId(order.getId());
-        seckillOrder.setGoodsId(sg.getGoodsId());
+        seckillOrder.setGoodsId(seckillGoodsId);
         seckillOrderMapper.insert(seckillOrder);
 
         // 8. 标记秒杀结果（设置 24h TTL，防止 Redis Key 永久占用）
@@ -277,7 +320,7 @@ public class SeckillService {
                 RabbitMQConfig.ORDER_DELAY_ROUTING_KEY,
                 order.getId());
 
-        log.info("秒杀成功: userId={}, orderId={}, goodsName={}", userId, order.getId(), goods.getGoodsName());
+        log.info("秒杀成功: userId={}, orderId={}, goodsName={}", userId, order.getId(), sg.getGoodsName());
     }
 
     /**
@@ -300,5 +343,20 @@ public class SeckillService {
         redisTemplate.opsForValue().set(
                 SECKILL_RESULT_KEY + userId + ":" + seckillGoodsId,
                 orderId, 24, TimeUnit.HOURS);
+    }
+
+    /**
+     * MQ消费时发生异常落库失败的补偿：回滚Redis占用坑位
+     */
+    public void handleSeckillFail(Long userId, Long seckillGoodsId) {
+        setResult(userId, seckillGoodsId, -1L);
+        // 回滚 Redis 库存，避免用户占用了 Redis 库存导致永久少卖
+        redisTemplate.opsForValue().increment(STOCK_KEY + seckillGoodsId);
+
+        // 删除排队成功的标记，让用户可以重新抢购
+        redisTemplate.delete(ORDER_KEY + userId + ":" + seckillGoodsId);
+
+        // 清除内存售罄标记
+        clearStockOverFlag(seckillGoodsId);
     }
 }

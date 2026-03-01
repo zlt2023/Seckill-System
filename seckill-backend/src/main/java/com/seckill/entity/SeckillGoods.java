@@ -16,9 +16,20 @@ public class SeckillGoods implements Serializable {
 
     @TableId(type = IdType.AUTO)
     private Long id;
+    /** 商品名称 */
+    private String goodsName;
 
-    /** 关联商品ID */
-    private Long goodsId;
+    /** 商品标题 */
+    private String goodsTitle;
+
+    /** 商品图片 */
+    private String goodsImg;
+
+    /** 商品详情 */
+    private String goodsDetail;
+
+    /** 商品原价 */
+    private BigDecimal goodsPrice;
 
     /** 秒杀价格 */
     private BigDecimal seckillPrice;
@@ -32,8 +43,15 @@ public class SeckillGoods implements Serializable {
     /** 秒杀结束时间 */
     private LocalDateTime endDate;
 
-    /** 状态: 0-未发布 1-进行中 2-已结束 */
-    private Integer status;
+    /**
+     * 秒杀商品状态: 0-下架 1-上架
+     */
+    private Integer goodsStatus;
+
+    /**
+     * 秒杀活动状态: 0-未发布 1-进行中 2-已结束
+     */
+    private Integer seckillStatus;
 
     @TableField(fill = FieldFill.INSERT)
     private LocalDateTime createTime;

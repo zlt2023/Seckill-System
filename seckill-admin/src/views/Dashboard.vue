@@ -109,9 +109,7 @@
                   </span>
                 </td>
                 <td>
-                  <button class="btn btn-outline btn-xs" @click="resetStock(item.seckillGoodsId, item.goodsName)">
-                    重置库存
-                  </button>
+                  <span class="text-muted" style="font-size: 0.8rem">无</span>
                 </td>
               </tr>
             </tbody>
@@ -124,7 +122,7 @@
 
 <script setup lang="ts">
 import { ref, computed, onMounted, onUnmounted } from 'vue'
-import { ElMessage, ElMessageBox } from 'element-plus'
+import { ElMessage } from 'element-plus'
 import { adminApi } from '../api'
 
 const loading = ref(true)
@@ -179,21 +177,6 @@ const conversionRate = computed(() => {
   return (data.value.orders.paid / data.value.orders.total * 100).toFixed(1)
 })
 
-async function resetStock(seckillGoodsId: number, goodsName: string) {
-  try {
-    const result = await ElMessageBox.prompt(`设置「${goodsName}」的新库存数量`, '重置库存', {
-      confirmButtonText: '确认重置',
-      cancelButtonText: '取消',
-      inputValue: '100',
-      inputPattern: /^\d+$/,
-      inputErrorMessage: '请输入正整数'
-    })
-    const value = (result as any).value
-    await adminApi.resetStock(seckillGoodsId, parseInt(value))
-    ElMessage.success(`库存已重置为 ${value}`)
-    await loadData()
-  } catch { /* cancelled */ }
-}
 
 function formatTime(t: string) {
   if (!t) return ''
