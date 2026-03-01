@@ -183,21 +183,12 @@ public class SeckillService {
             throw new BusinessException(ResultCode.SECKILL_STOCK_EMPTY);
         }
 
-        // 2. 校验秒杀商品及时间窗口
-        SeckillGoods sg = seckillGoodsMapper.selectById(seckillGoodsId);
-        if (sg == null) {
-            throw new BusinessException(ResultCode.GOODS_NOT_FOUND);
-        }
-        if (sg.getGoodsStatus() != 1 || sg.getSeckillStatus() != 1) {
-            throw new BusinessException("该商品未能参与秒杀活动，无法被抢购");
-        }
-        LocalDateTime now = LocalDateTime.now();
-        if (now.isBefore(sg.getStartDate())) {
-            throw new BusinessException(ResultCode.SECKILL_NOT_START);
-        }
-        if (now.isAfter(sg.getEndDate())) {
-            throw new BusinessException(ResultCode.SECKILL_ENDED);
-        }
+        // 2. 校验秒杀商品及时间窗口 (原先此处的 DB 查询已移除)
+        // 核心解答：绝对没必要在此做 DB 查询！这是扛万级并发的前线，查 MySQL 会使得 Redis 前置形同虚设引发雪崩。
+        // 时间窗口和状态已经在两个地方做了最严密的闭环保护：
+        // (1) 事前保护：如果尚未开始，STOCK_KEY 在 Redis 中根本不存在（Lua 返回 0）
+        // (2) 事后保护：如果已结束，Scheduler 会把 STOCK_KEY 清除（Lua 返回 0）
+        // (3) 终极防线：消费者 executeSeckill() 写入数据库前，仍会稳稳当当地查一次 DB 判断时间！
 
         // 3. 【P0-3 修复】原子 Lua 脚本: 重复秒杀判断 + 库存预减
         // 将原来分离的 setIfAbsent + Lua decr 合并为单个原子操作
