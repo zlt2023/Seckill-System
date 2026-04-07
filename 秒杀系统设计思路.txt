@@ -1,0 +1,623 @@
+================================================================================
+                           秒杀系统 - 完整设计方案
+================================================================================
+
+【技术栈】
+  前端：Vue 3 + Vite + Element Plus + Pinia + Axios
+  后端：Java 17 + Spring Boot 3 + MyBatis-Plus
+  缓存：Redis 7 (Lua 脚本)
+  数据库：MySQL 8
+  消息队列：RabbitMQ
+  认证：JWT (无状态)
+  构建：Maven
+
+
+================================================================================
+一、系统功能模块
+================================================================================
+
+【用户端】(独立前端)
+  ├── 秒杀商品列表      查看所有秒杀活动，展示倒计时、价格、库存
+  ├── 秒杀商品详情      商品详情 + 实时倒计时 + 抢购按钮
+  ├── 执行秒杀          动态路径获取 → 提交抢购 → 轮询结果
+  ├── 我的订单          查看订单列表、订单详情、模拟支付、取消订单
+  └── 个人信息          登录 / 注册 / 个人资料
+
+【管理端】(独立前端)
+  ├── 秒杀商品管理      新增/编辑/删除秒杀活动，重新加载缓存
+  ├── 商品管理          维护基础商品信息(名称/原价/图片/详情)
+  ├── 订单管理          查看所有秒杀订单，筛选订单状态
+  └── 用户管理          查看注册用户列表
+
+
+================================================================================
+二、系统架构 - 流量漏斗模型
+================================================================================
+
+  核心思想：层层递减，绝不让高并发流量直接打到 MySQL
+
+  用户请求 (100%)
+      │
+      ▼
+  ┌─────────────────────────────────┐
+  │ 第1层: 前端防护                  │ → 按钮防抖(点击后置灰3秒)
+  │   按钮置灰 + 倒计时校验          │   倒计时未归零不可点击
+  └─────────────────────────────────┘
+      │
+      ▼
+  ┌─────────────────────────────────┐
+  │ 第2层: Nginx 限流               │ → 拦截 ~40% 恶意/超频请求
+  │   limit_req + IP黑名单          │   同一IP每秒最多N次请求
+  └─────────────────────────────────┘
+      │
+      ▼
+  ┌─────────────────────────────────┐
+  │ 第3层: 接口安全校验              │ → 拦截 ~30% 脚本/Bot请求
+  │   JWT认证 + 动态路径Token校验    │   路径Token 60秒过期
+  └─────────────────────────────────┘
+      │
+      ▼
+  ┌─────────────────────────────────┐
+  │ 第4层: JVM 内存标记              │ → 已售罄商品直接返回
+  │   localOverMap 本地缓存          │   不访问Redis，最快失败 (L1缓存)
+  └─────────────────────────────────┘
+      │
+      ▼
+  ┌─────────────────────────────────┐
+  │ 第5层: Redis Lua 原子扣减        │ → 整合校验：行政状态 + 时间 + 库存
+  │   Hash 存储 + Set 判重           │   一次网络往返完成所有准入校验
+  └─────────────────────────────────┘
+      │
+      ▼  (仅 ~1% 请求到达此处)
+  ┌─────────────────────────────────┐
+  │ 第6层: RabbitMQ 异步入队         │ → 削峰填谷，保护数据库
+  │   消费者扣减MySQL库存+生成订单   │   平稳消费，最终一致
+  └─────────────────────────────────┘
+
+
+================================================================================
+三、数据库设计 (4张表)
+================================================================================
+
+【1. 用户表 t_user】
+  ┌──────────────┬──────────────┬───────────────────────────┐
+  │ 字段          │ 类型          │ 说明                      │
+  ├──────────────┼──────────────┼───────────────────────────┤
+  │ id           │ BIGINT PK    │ 用户ID                    │
+  │ username     │ VARCHAR(50)  │ 用户名(登录账号,唯一)       │
+  │ password     │ VARCHAR(128) │ BCrypt加密密码              │
+  │ phone        │ VARCHAR(20)  │ 手机号(唯一)               │
+  │ nickname     │ VARCHAR(50)  │ 昵称                      │
+  │ role         │ TINYINT      │ 角色: 0-普通用户 1-管理员   │
+  │ create_time  │ DATETIME     │ 注册时间                   │
+  │ update_time  │ DATETIME     │ 更新时间                   │
+  └──────────────┴──────────────┴───────────────────────────┘
+  索引: uk_username(username)
+
+【2. 商品表 t_goods】
+  ┌──────────────┬────────────────┬────────────────────────┐
+  │ 字段          │ 类型            │ 说明                   │
+  ├──────────────┼────────────────┼────────────────────────┤
+  │ id           │ BIGINT PK      │ 商品ID                 │
+  │ goods_name   │ VARCHAR(100)   │ 商品名称               │
+  │ goods_price  │ DECIMAL(10,2)  │ 商品原价               │
+  │ goods_img    │ VARCHAR(255)   │ 商品图片URL            │
+  │ goods_detail │ TEXT           │ 商品详情(富文本)        │
+  │ create_time  │ DATETIME       │ 创建时间               │
+  │ update_time  │ DATETIME       │ 更新时间               │
+  └──────────────┴────────────────┴────────────────────────┘
+
+【3. 秒杀商品表 t_seckill_goods】
+  ┌─────────────────┬────────────────┬──────────────────────────────┐
+  │ 字段              │ 类型            │ 说明                          │
+  ├─────────────────┼────────────────┼──────────────────────────────┤
+  │ id               │ BIGINT PK      │ 秒杀商品ID                    │
+  │ goods_id         │ BIGINT FK      │ 关联商品ID(唯一)               │
+  │ seckill_price    │ DECIMAL(10,2)  │ 秒杀价格                      │
+  │ total_stock      │ INT            │ 秒杀总库存(初始值,不变)         │
+  │ available_stock  │ INT            │ 剩余可用库存                   │
+  │ status           │ TINYINT        │ 行政状态: 0-已下架(暂停), 1-已上架  │
+  │ start_time       │ DATETIME       │ 秒杀开始时间 (硬性时间约束)        │
+  │ end_time         │ DATETIME       │ 秒杀结束时间 (硬性时间约束)        │
+  │ create_time      │ DATETIME       │ 创建时间                      │
+  │ update_time      │ DATETIME       │ 更新时间                      │
+  └─────────────────┴────────────────┴──────────────────────────────┘
+  索引: uk_goods_id(goods_id), idx_status(status)
+  注：status 现作为管理员手动控制的“闸门”，不再随时间自动流转。
+      业务可见性逻辑 = (status == 1) AND (now BETWEEN start_time AND end_time)
+
+【4. 秒杀订单表 t_seckill_order】
+  ┌──────────────────┬────────────────┬──────────────────────────────┐
+  │ 字段               │ 类型            │ 说明                          │
+  ├──────────────────┼────────────────┼──────────────────────────────┤
+  │ id                │ BIGINT PK      │ 订单ID                       │
+  │ order_no          │ VARCHAR(32) UK │ 订单编号(雪花算法,唯一)        │
+  │ user_id           │ BIGINT FK      │ 用户ID                       │
+  │ seckill_goods_id  │ BIGINT FK      │ 秒杀商品ID                    │
+  │ seckill_price     │ DECIMAL(10,2)  │ 成交价格(下单时快照)           │
+  │ status            │ TINYINT        │ 0-待支付 1-已支付 2-已取消 3-已超时 │
+  │ create_time       │ DATETIME       │ 下单时间                      │
+  │ pay_time          │ DATETIME       │ 支付时间                      │
+  │ update_time       │ DATETIME       │ 更新时间                      │
+  └──────────────────┴────────────────┴──────────────────────────────┘
+  索引: uk_order_no(order_no)
+        idx_user_id(user_id)
+        idx_status(status)
+
+
+================================================================================
+四、Redis 缓存设计
+================================================================================
+
+【Key 命名规范】
+
+  Key 模式                                    类型     说明                 过期时间
+  ─────────────────────────────────────────────────────────────────────────────────
+  seckill:info:{seckillGoodsId}               Hash     核心元数据聚合        活动结束后+1h
+                                                      (startTime/endTime/price/stock/status)
+  seckill:bought:{seckillGoodsId}             Set      已购买用户ID集合      活动结束后+1h
+  seckill:path:{userId}:{seckillGoodsId}      String   动态秒杀路径Token     60秒
+  seckill:result:{userId}:{seckillGoodsId}    String   秒杀结果(0排队/1成功/2失败) 30分钟
+  
+【Lua 脚本 - 原子扣减库存】
+
+  -- KEYS[1] = seckill:info:{id}        聚合信息Hash (源头数据)
+  -- KEYS[2] = seckill:bought:{id}      已购买集合Key
+  -- ARGV[1] = userId
+  -- ARGV[2] = nowTime (当前服务器毫秒时间)
+
+  步骤1: 检查行政状态 → HGET KEYS[1] "status" 
+         status != 1 → return -3 (活动已手动下架或暂停)
+
+  步骤2: 校验时间视窗 → HGETS KEYS[1] "startTime" "endTime"
+         nowTime < startTime → return -4 (秒杀未开始)
+         nowTime >= endTime → return -4 (秒杀已结束，含边界时间点)
+
+  步骤3: 检查重复购买 → SISMEMBER KEYS[2] ARGV[1]
+         已存在 → return -2
+
+  步骤4: 校验并原子扣减库存 → HGET KEYS[1] "stock"
+         库存 <= 0 → return -1
+         库存 > 0  → HINCRBY KEYS[1] "stock" -1, SADD KEYS[2] ARGV[1], return 1
+
+  返回值含义:
+     1  → 预占成功，进入MQ异步订单流
+    -1  → 库存不足/售罄
+    -2  → 重复购买
+    -3  → 活动非上架状态
+    -4  → 非秒杀时段
+
+  [!] Lua脚本在Redis中原子执行，天然解决高并发下的超卖与重入问题。
+
+【缓存预热机制】
+  时机: Spring Boot 启动 (ApplicationRunner) 或 管理端手动 Reload
+  逻辑: 1. 执行 Redis 深度清理 (Deep Clean)，清空所有 `seckill:*` 历史冗余 Key。
+        2. 扫描数据库中 `status=1` 且 `endTime > now` 的活跃活动。
+        3. 批量将活动元数据封装进 `seckill:info:{id}` Hash 结构中。
+        4. 设置 Key 生存周期为 (活动结束时间 + 1小时缓冲)，实现自动内存释放。
+
+
+================================================================================
+五、RabbitMQ 消息队列设计
+================================================================================
+
+【队列拓扑】
+
+  秒杀服务(Producer)
+      │
+      │ 发送秒杀消息
+      ▼
+  seckill.exchange (Direct交换机)
+      │
+      │ routing-key: seckill.order
+      ▼
+  seckill.order.queue (秒杀订单队列)
+      │
+      │ 消费消息
+      ▼
+  订单消费者 (SeckillMessageConsumer)
+      │
+      │ 消费失败/超过重试次数
+      ▼
+  seckill.dlx.exchange (死信交换机)
+      │
+      ▼
+  seckill.dlq.queue (死信队列) → 人工监控/告警
+
+【消息体】
+  {
+    "userId": 10001,
+    "seckillGoodsId": 5,
+    "seckillPrice": 99.00,
+    "timestamp": 1711929600000,
+    "requestId": "uuid-xxxx"     ← 幂等性标识
+  }
+
+【消费者处理流程】
+
+  接收MQ消息
+      │
+      ▼
+  获取 Redis 分布式锁 (setnx防高并发消息重放)
+      │
+      ▼
+  幂等性检查: 该用户+该商品是否已有[待支付/已支付]订单？
+      │
+  ┌───┴───┐
+  │已存在  │ → 跳过处理，ACK消息
+  │       │
+  │不存在  │ → 开启数据库事务
+  └───┬───┘
+      │
+      ▼
+  MySQL扣减库存 (最终行政防御):
+  UPDATE t_seckill_goods SET available_stock = available_stock - 1
+  WHERE id = ? AND available_stock > 0 AND status = 1
+      │
+  ┌───┴───┐
+  │成功    │ → 创建订单(INSERT t_seckill_order)
+  │(rows>0)│   → Redis设置 result = 1 (成功)
+  │       │   → 发送延迟消息(订单超时取消，15分钟)
+  │       │   → 提交事务，ACK消息
+  │       │
+  │失败    │ → Redis回滚: INCR库存 + SREM购买标记
+  │(rows=0)│   → Redis设置 result = 2 (失败)
+  └───────┘   → ACK消息
+
+【可靠性保障】
+  · 开启 Publisher Confirm (生产者确认，防消息丢失)
+  · 消费端手动 ACK (处理完才确认)
+  · 失败重试最多3次，超限进入死信队列
+  · 唯一索引 uk_order_no 订单编号唯一 (数据库兜底幂等性)
+  · Redis 分布式锁防短时并发消费 (10秒过期，仅保护幂等性检查)
+
+
+================================================================================
+六、秒杀核心流程 (详细版)
+================================================================================
+
+┌──────────────────────────────────────────────────────────────────────────────┐
+│                        完 整 秒 杀 流 程                                     │
+├──────────────────────────────────────────────────────────────────────────────┤
+│                                                                              │
+│  ==================== 阶段1: 获取动态路径 ====================               │
+│                                                                              │
+│  用户点击[抢购]按钮                                                           │
+│      │                                                                       │
+│      ▼                                                                       │
+│  前端 → GET /api/seckill/path/{seckillGoodsId}                              │
+│      │                                                                       │
+│      ▼                                                                       │
+│  后端生成随机Token(UUID) → 存入Redis(60秒TTL) → 返回Token                    │
+│                                                                              │
+│  ==================== 阶段2: 执行秒杀 ====================                  │
+│                                                                              │
+│  前端 → POST /api/seckill/{token}/execute?seckillGoodsId=5                  │
+│      │                                                                       │
+│      ▼                                                                       │
+│  ① 验证动态路径Token (Redis中是否匹配)                                       │
+│      │ 无效 → 返回"非法请求"                                                 │
+│      │ 有效 ↓                                                                │
+│      ▼                                                                       │
+│  ② JVM内存标记检查 (localOverMap)                                            │
+│      │ 已售罄 → 直接返回"已售罄"                                              │
+│      │ 未售罄 ↓                                                               │
+│      ▼                                                                       │
+│  ③ 执行Redis Lua脚本 (原子操作)                                              │
+│      │                                                                       │
+│      ├─ return -1 → 已售罄，更新JVM本地标记，返回"已售罄"                     │
+│      ├─ return -2 → 返回"请勿重复购买"                                        │
+│      └─ return  1 ↓                                                          │
+│      ▼                                                                       │
+│  ④ 发送MQ消息到 seckill.order.queue                                          │
+│  ⑤ Redis设置 result = 0 (排队中)                                             │
+│  ⑥ 返回前端 "排队中，请等待结果"                                              │
+│                                                                              │
+│  ==================== 阶段3: 异步下单 ====================                   │
+│                                                                              │
+│  MQ消费者接收消息                                                             │
+│      │                                                                       │
+│      ▼                                                                       │
+│  幂等性检查 → 数据库事务{扣减MySQL库存 + 创建订单}                             │
+│      │                                                                       │
+│      ├─ 成功  → Redis result = 1, 发送延迟消息(15分钟超时取消)                │
+│      └─ 失败  → Redis回滚库存, Redis result = 2                              │
+│                                                                              │
+│  ==================== 阶段4: 轮询结果 ====================                   │
+│                                                                              │
+│  前端每2秒轮询: GET /api/seckill/result/{seckillGoodsId}                     │
+│      │                                                                       │
+│      ├─ result = 0  → 继续轮询 (最多15次/30秒)                                │
+│      ├─ result = 1  → 抢购成功！显示订单号，跳转支付                           │
+│      └─ result = 2  → 抢购失败，提示"库存不足，请下次再试"                     │
+│                                                                              │
+│  ==================== 阶段5: 订单超时取消 ====================               │
+│                                                                              │
+│  用户15分钟内未支付                                                           │
+│      │                                                                       │
+│      ▼                                                                       │
+│  延迟队列消息到期(TTL+DLX) → 超时消费者检查订单状态                           │
+│      │                                                                       │
+│      ├─ 已支付 → 跳过                                                        │
+│      └─ 待支付 → UPDATE status=3(超时)                                       │
+│                → MySQL available_stock + 1                                   │
+│                → Redis INCR库存 + SREM购买标记                               │
+│                                                                              │
+└──────────────────────────────────────────────────────────────────────────────┘
+
+
+================================================================================
+七、安全防护设计 (5层防御体系)
+================================================================================
+
+  第1层【前端防护】
+    · 抢购按钮点击后置灰3秒(防抖)
+    · 倒计时未归零时按钮禁用
+    · 前端请求频率限制
+
+  第2层【Nginx防护】
+    · limit_req 限流 (每秒N次/IP)
+    · IP黑名单过滤
+
+  第3层【接口安全】
+    · JWT Token 身份认证
+    · 动态秒杀路径 pathToken (60秒有效)
+    · 接口级限流 (Redis计数器 + 自定义注解@RateLimit)
+
+  第4层【业务防护】
+    · JVM内存标记 (售罄商品本地缓存)
+    · Redis Lua 重复购买检查 (SISMEMBER)
+    · Redis Lua 库存原子扣减
+
+  第5层【数据库兜底与并发安全】
+    · Redis 分布式防重锁兜底消息高并发幂等性 (允许合法重买)
+    · 秒杀下单扣库存: WHERE available_stock > 0 乐观锁防超卖
+    · 订单状态流转: UPDATE status = ? WHERE status = 0 原子更新防竞态(TOCTOU)
+
+【动态路径设计(接口隐藏)】
+  目的: 防止用户提前知道秒杀接口URL，用脚本直接刷
+
+  秒杀前 → 接口地址未知
+      ↓
+  用户点击抢购 → GET /api/seckill/path/{goodsId}
+      ↓
+  后端生成随机Token → 存入Redis(60秒过期)
+      ↓
+  前端拼接真正请求 → POST /api/seckill/{token}/execute
+      ↓
+  后端校验Token是否匹配Redis记录
+
+【自定义限流注解】
+  @AccessLimit(seconds = 5, maxCount = 5, needLogin = true)
+  含义: 同一用户5秒内最多访问5次
+  实现: AOP拦截 + Redis INCR + EXPIRE
+
+
+================================================================================
+八、前端设计
+================================================================================
+
+【技术选型】
+  · Vue 3 + Composition API
+  · Vite 构建
+  · Element Plus UI组件库
+  · Pinia 状态管理
+  · Vue Router 路由(含权限守卫)
+  · Axios 请求封装(JWT拦截器)
+
+【页面结构】
+  src/
+  ├── views/
+  │   ├── Login.vue                      登录页
+  │   ├── Register.vue                   注册页
+  │   ├── Home.vue                       秒杀商品列表(首页)
+  │   ├── Detail.vue                     秒杀详情 + 抢购
+  │   ├── MyOrder.vue                    我的订单
+  │   ├── Layout.vue                     用户端布局
+  │   └── admin/                         管理端
+  │       ├── AdminLayout.vue            管理端布局
+  │       ├── AdminGoods.vue            商品管理
+  │       ├── AdminSeckill.vue           秒杀活动管理
+  │       ├── AdminOrder.vue             订单管理
+  │       └── AdminUser.vue              用户管理
+  ├── components/
+  │   └── HelloWorld.vue                 (示例组件)
+  ├── api/                               接口定义
+  ├── store/                             Pinia状态
+  ├── router/                            路由+守卫
+  └── utils/
+      ├── request.js                     Axios封装+JWT拦截
+      └── time.js                        服务器时间校准
+
+【核心交互】
+
+  (1) 倒计时组件
+      · 页面加载时请求 GET /api/seckill/time 获取服务器时间
+      · 计算 serverTimeDiff = 服务器时间 - 本地时间 - 网络延迟/2
+      · setInterval 每秒更新倒计时显示
+      · 倒计时归零后自动激活抢购按钮
+      · 组件销毁时清除定时器(防内存泄漏)
+
+  (2) 抢购流程
+      用户点击[立即抢购] → 按钮置灰
+        → 请求动态路径
+        → 提交秒杀请求
+        → 显示"排队中..."
+        → 每2秒轮询结果(最多15次)
+        → 成功: 显示订单号 + [前往支付]
+        → 失败: 提示原因，恢复按钮
+
+  (3) 结果轮询
+      · 轮询接口: GET /api/seckill/result/{seckillGoodsId}
+      · 间隔: 2秒
+      · 最大次数: 15次(30秒超时)
+      · result=0 继续轮询, result=1 成功, result=2 失败
+
+
+================================================================================
+九、API 接口设计
+================================================================================
+
+【用户端 - 认证】
+  POST  /api/auth/register              用户注册
+  POST  /api/auth/login                 用户登录(返回JWT)
+  GET   /api/auth/me                    获取当前用户信息          [需认证]
+
+【用户端 - 秒杀】
+  GET   /api/seckill/goods              秒杀商品列表
+  GET   /api/seckill/goods/{id}         秒杀商品详情
+  GET   /api/seckill/time               获取服务器时间(倒计时校准)
+  GET   /api/seckill/path/{sgid}        获取动态秒杀路径Token     [需认证]
+  POST  /api/seckill/{path}/execute     执行秒杀(核心接口)        [需认证]
+  GET   /api/seckill/result/{sgid}      轮询秒杀结果              [需认证]
+
+【用户端 - 订单】
+  GET   /api/order/list                 我的订单列表              [需认证]
+  GET   /api/order/{orderNo}            订单详情                  [需认证]
+  POST  /api/order/{orderNo}/pay        模拟支付                  [需认证]
+  POST  /api/order/{orderNo}/cancel     取消订单                  [需认证]
+
+【管理端】(所有接口需管理员权限)
+  GET    /api/admin/goods               商品列表(分页)
+  POST   /api/admin/goods               新增商品
+  PUT    /api/admin/goods/{id}          修改商品
+  DELETE /api/admin/goods/{id}          删除商品
+  GET    /api/admin/seckill-goods       秒杀商品列表
+  POST   /api/admin/seckill-goods       新增秒杀活动
+  PUT    /api/admin/seckill-goods/{id}  修改秒杀活动
+  DELETE /api/admin/seckill-goods/{id}  删除秒杀活动
+  POST   /api/admin/seckill-goods/{id}/reload   重新加载缓存
+  GET    /api/admin/orders              全部订单(分页)
+  GET    /api/admin/users               用户列表(分页)
+
+
+================================================================================
+十、数据一致性保障
+================================================================================
+
+【正常流程一致性】
+  环节                  Redis状态               MySQL状态             结果
+  ───────────────────────────────────────────────────────────────────────
+  Lua扣减成功           库存-1, 用户加入Set     无变化                 -
+  MQ消费成功            result=1(成功)          库存-1, 订单已创建     最终一致 ✓
+  MQ消费失败(库存不足)  库存+1回滚, 移出Set     无变化                 回滚一致 ✓
+
+【异常场景处理】
+  场景                        处理方案
+  ──────────────────────────────────────────────────────────────────
+  Redis扣减后MQ发送失败       捕获异常，回滚Redis(INCR + SREM)
+  MQ消费者处理超时            消息重投(最多3次)，幂等性检查兜底
+  Redis宕机                   从MySQL重新加载缓存，触发预热
+  MySQL宕机                   MQ消息保留，待恢复后重新消费
+  Redis与MySQL库存不一致      定时对账任务每5分钟修复(以MySQL为准)
+
+【定时对账任务】
+  · 频率: 每天凌晨2点执行 (SeckillOrderTask.reconcileData)
+  · 逻辑: 查询所有秒杀商品
+          → 对比Redis库存 vs MySQL available_stock
+          → 不一致时以MySQL为准修正Redis
+          → 检查bought Set一致性（清理已取消/超时但仍在Set中的用户）
+          → 销量对账（售出总量与有效订单数对比）
+          → 记录告警日志
+
+【秒杀状态与缓存维护】
+  · 频率: 每10分钟执行 (SeckillOrderTask.scanTimeoutOrders)
+  · 逻辑: 扫描超时未支付订单（创建时间在16分钟前的待支付订单）
+          → 自动取消超时订单并回滚库存
+          → 与MQ延迟消息形成双保险
+
+
+================================================================================
+十一、订单超时取消 (延迟队列)
+================================================================================
+
+【方案: RabbitMQ TTL + DLX (死信交换机)】
+
+  订单创建成功
+      │
+      ▼
+  发送延迟消息到 delay.queue (消息TTL=15分钟)
+      │
+      │ 15分钟后消息过期
+      ▼
+  转发到死信交换机 → cancel.queue
+      │
+      ▼
+  OrderTimeoutConsumer 消费超时消息
+      │
+      ▼
+  查询订单状态
+      │
+  ┌───┴───┐
+  │已支付  │ → 跳过，无需处理
+  │       │
+  │待支付  │ → 原子更新 UPDATE status = 3 WHERE status = 0 (防并发支付冲突)
+  │       │   UPDATE available_stock + 1 (MySQL回滚)
+  │       │   Redis INCR库存 + SREM购买标记
+  │       │   清除 JVM localOverMap 售罄标记 (允许恢复抢购)
+  └───────┘
+
+
+================================================================================
+十二、后端项目结构
+================================================================================
+
+  seckill-backend/
+  ├── pom.xml
+  └── src/main/java/com/seckill/
+      ├── SeckillApplication.java                启动类
+      │
+      ├── config/
+      │   ├── RedisConfig.java                   Redis + Lua脚本配置
+      │   ├── RabbitConfig.java                  MQ队列/交换机/绑定
+      │   ├── WebMvcConfig.java                  跨域 + 拦截器注册
+      │   └── SecurityConfig.java                JWT配置
+      │
+      ├── controller/
+      │   ├── AuthController.java                认证接口
+      │   ├── SeckillController.java             秒杀接口
+      │   ├── OrderController.java               订单接口(用户端)
+      │   └── admin/
+      │       ├── AdminGoodsController.java      商品管理
+      │       ├── AdminSeckillController.java    秒杀管理
+      │       ├── AdminOrderController.java      订单管理
+      │       └── AdminUserController.java       用户管理
+      │
+      ├── service/
+      │   ├── UserService.java
+      │   ├── GoodsService.java
+      │   ├── SeckillService.java                秒杀核心逻辑
+      │   ├── OrderService.java
+      │   └── CacheWarmupService.java            缓存预热
+      │
+      ├── mq/
+      │   ├── SeckillMessageSender.java          MQ生产者
+      │   ├── SeckillMessageConsumer.java        MQ消费者(创建订单)
+      │   └── OrderTimeoutConsumer.java          超时取消消费者
+      │
+      ├── entity/                                实体类
+      ├── mapper/                                MyBatis Mapper
+      ├── dto/                                   数据传输对象
+      │
+      ├── common/
+      │   ├── Result.java                        统一响应封装
+      │   ├── ResultCode.java                    状态码枚举
+      │   └── PageResult.java                    分页结果
+      │
+      ├── annotation/
+      │   └── AccessLimit.java                    限流注解
+      │
+      ├── interceptor/
+      │   ├── JwtInterceptor.java                JWT认证拦截器
+      │   └── AdminInterceptor.java               管理员权限拦截器
+      │
+      ├── exception/
+      │   ├── BusinessException.java             业务异常
+      │   └── GlobalExceptionHandler.java        全局异常处理
+      │
+      └── task/
+          └── SeckillOrderTask.java              订单超时兜底 + 定时对账
+
+
+================================================================================
+
